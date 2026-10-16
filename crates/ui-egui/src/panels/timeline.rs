@@ -19,8 +19,20 @@ use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 use crate::{EffectcraftApp, widgets};
 
+#[path = "timeline_groups.rs"]
+mod organization;
+#[path = "timeline_rigs.rs"]
+mod rigs;
+
 #[derive(Clone, Debug)]
 enum RowKind {
+    TimelineGroup {
+        id: u64,
+    },
+    Rig {
+        id: u64,
+        property: bool,
+    },
     Layer,
     Group {
         uid: u64,
@@ -390,6 +402,7 @@ impl Vis {
     }
 }
 
+#[derive(Clone, Copy)]
 struct Cols {
     vis: Vis,
     av: f32,
@@ -924,7 +937,21 @@ fn build_rows(app: &EffectcraftApp, comp: &Comp) -> Vec<Row> {
             }
         }
     }
-    rows
+    let mut combined = Vec::new();
+    for row in rows {
+        if matches!(row.kind, RowKind::Layer) {
+            for rig in comp.rigs2d.iter().filter(|r| r.layers[0] == row.layer) {
+                // The layer field only anchors this UI row's placement. It is
+                // never registered as a layer hit or offered layer operations.
+                combined.push(Row { layer: row.layer, depth: 0, kind: RowKind::Rig { id: rig.id.0, property: false } });
+                if tl.open_groups.contains(&rig.id.0) {
+                    combined.push(Row { layer: row.layer, depth: 1, kind: RowKind::Rig { id: rig.id.0, property: true } });
+                }
+            }
+        }
+        combined.push(row);
+    }
+    organization::rows(combined, comp)
 }
 
 /// Rows of a twirled-open layer under the reveal shortcuts (one, or several added with Shift):
@@ -1976,12 +2003,24 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if r.max.y < rows_rect.min.y || r.min.y > rows_rect.max.y {
             continue;
         }
+        if let RowKind::TimelineGroup { id } = row.kind {
+            ui.set_clip_rect(full_clip);
+            organization::draw(app, ui, &comp, id, r, &cw, graph_x0, &mut actions);
+            continue;
+        }
+        let cw = Cols { name: cw.name + if comp.timeline_groups.iter().any(|g| g.layers.contains(&row.layer)) { 14.0 } else { 0.0 }, ..cw };
+        if let RowKind::Rig { id, property } = row.kind {
+            ui.set_clip_rect(full_clip);
+            rigs::draw(app, ui, &comp, id, property, r, &cw, graph_x0, &tm, time, left_clip, right_clip, &mut actions);
+            continue;
+        }
         hit_rows.push((r, row.clone()));
         let Some(layer) = comp.layer(row.layer) else { continue };
         let is_sel = selected.contains(&layer.id);
         let left = Rect::from_min_max(r.min, pos2(graph_x0 - 1.0, r.max.y));
         let cy = r.min.y + rh / 2.0;
         match &row.kind {
+            RowKind::Rig { .. } | RowKind::TimelineGroup { .. } => {} // Organizational/control rows have no layer widgets.
             RowKind::Layer => {
                 // After Effects draws layer rows as one flat tone separated by dark hairlines
                 // (outline and time graph alike), not as alternating stripes.
@@ -2103,7 +2142,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         None => start_rename(&ctx, layer.id.0, &layer.name),
                     }
                 }
-                layer_context_menu(&row_resp, &comp, layer, &selected, LayerMenuCaps::of(&app.session.project, layer), &mut actions);
+                layer_context_menu(&row_resp, &comp, layer, &selected, LayerMenuCaps::of(&app.session.project, layer), &mut app.auto, &mut actions);
                 // Switches.
                 let sws: [(Icon, bool, &str, bool); 8] = [
                     (Icon::Shy, sw.shy, "shy", true),
@@ -2324,7 +2363,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                             set_anchor(&ctx, cid, layer.id);
                         }
                     }
-                    layer_context_menu(&body, &comp, layer, &selected, LayerMenuCaps::of(&app.session.project, layer), &mut actions);
+                    layer_context_menu(&body, &comp, layer, &selected, LayerMenuCaps::of(&app.session.project, layer), &mut app.auto, &mut actions);
                     let drag_key = format!("bar-{}", layer.id.0);
                     // Ctrl/Cmd+Alt dragging a selected bar: Quick Offset (#1012), chosen as the
                     // drag starts and followed below the rows until the button is released.
@@ -2861,6 +2900,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                                 ("-", "", json!({})),
                                 ("Copy", "keys.copy", json!({})),
                                 ("Paste", "keys.paste", json!({})),
+                                ("Copy Value", "keys.copyValue", json!({"layer":layer.id.0,"prop":uid,"time":k.time.seconds()})),
+                                ("Paste Value", "keys.pasteValue", json!({"layer":layer.id.0,"prop":uid,"time":k.time.seconds()})),
                                 ("-", "", json!({})),
                                 ("Select Equal Keyframes", "keys.selectEqual", json!({})),
                                 ("Select Previous Keyframes", "keys.selectPrevious", json!({})),
@@ -2909,7 +2950,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                                 if lbl == "Edit Value…" && !matches!(k.value, Value::Scalar(_) | Value::Vec2(_) | Value::Vec3(_)) {
                                     continue;
                                 }
-                                if ui.button(lbl).clicked() {
+                                let response = ui.add_enabled(cmd != "keys.pasteValue" || app.session.state.value_clipboard.len() == 1, egui::Button::new(lbl));
+                                if matches!(cmd, "keys.copyValue" | "keys.pasteValue") {
+                                    app.auto.add(&format!("timeline.keyAt.{uid}.{}.{}", k.time.0, cmd), response.rect, lbl);
+                                }
+                                if response.clicked() {
                                     if !ks {
                                         actions.push(("keys.select".into(), json!({"keys": [{"layer": layer.id.0, "prop": uid, "time": k.time.seconds()}]})));
                                     }
@@ -3804,6 +3849,7 @@ fn prop_menu(
         }
     };
     item(ui, "reset", "Reset", false, "prop.reset", json!({"layer": l, "prop": uid}));
+    item(ui, "pasteValue", "Paste Value", false, "keys.pasteValue", json!({"layer":l,"prop":uid}));
     if matches!(prop.value, Value::Scalar(_) | Value::Vec2(_) | Value::Vec3(_)) {
         item(ui, "editValue", "Edit Value…", false, "prop.set", json!({"layer": l, "prop": uid}));
     }
@@ -3863,6 +3909,7 @@ fn layer_context_menu(
     layer: &Layer,
     selected: &[LayerId],
     caps: LayerMenuCaps,
+    auto: &mut crate::automation::Registry,
     actions: &mut Vec<(String, serde_json::Value)>,
 ) {
     let in_selection = selected.contains(&layer.id);
@@ -3870,7 +3917,10 @@ fn layer_context_menu(
         actions.push(("layer.select".into(), json!({"layers": [layer.id.0]})));
     }
     let targets: Vec<u64> = if in_selection { comp.layers.iter().filter(|l| selected.contains(&l.id)).map(|l| l.id.0).collect() } else { vec![layer.id.0] };
-    crate::widgets::context_menu(resp, |ui| layer_menu(ui, &targets, caps, actions));
+    crate::widgets::context_menu(resp, |ui| {
+        organization::layer_menu(ui, auto, comp, &targets, actions);
+        layer_menu(ui, &targets, caps, actions);
+    });
 }
 
 /// Shared layer actions for Timeline rows and Composition context menus.

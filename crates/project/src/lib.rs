@@ -12,8 +12,10 @@ pub mod limits;
 pub mod props;
 pub mod render_queue;
 pub mod render_templates;
+pub mod rig2d;
 pub mod sequence;
 pub mod styles;
+pub mod timeline_groups;
 pub mod tracking;
 
 use std::collections::BTreeMap;
@@ -416,6 +418,11 @@ pub struct Comp {
     pub work_area: (Tick, Tick),
     /// Layer #1 first (top of the stack).
     pub layers: Vec<Layer>,
+    /// Two-bone rig definitions and their controls; never helper layers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rigs2d: Vec<rig2d::Rig2d>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub timeline_groups: Vec<timeline_groups::TimelineGroup>,
     #[serde(default)]
     pub markers: Vec<Marker>,
     pub shutter_angle: f64,
@@ -509,6 +516,26 @@ fn adaptive_limit_default() -> u32 {
 }
 
 impl Comp {
+    /// Animation owners share the global ID namespace. The legacy `layer` field
+    /// in key/property references may address a rig control, never a render layer.
+    pub fn animation_property(&self, owner: LayerId, uid: Uid) -> Option<&Property> {
+        self.layer(owner).and_then(|l| l.props.find(uid)).or_else(|| self.rigs2d.iter().find(|r| r.id.0 == owner.0 && r.target.uid == uid).map(|r| &r.target))
+    }
+
+    pub fn animation_property_mut(&mut self, owner: LayerId, uid: Uid) -> Option<&mut Property> {
+        if let Some(i) = self.layers.iter().position(|l| l.id == owner) {
+            return self.layers.get_mut(i)?.props.find_mut(uid);
+        }
+        self.rigs2d.iter_mut().find(|r| r.id.0 == owner.0 && r.target.uid == uid).map(|r| &mut r.target)
+    }
+
+    pub fn animation_time(&self, owner: LayerId, time: Tick) -> Tick {
+        self.layer(owner).map_or(time, |l| l.layer_time(time))
+    }
+
+    pub fn animation_comp_time(&self, owner: LayerId, time: Tick) -> Tick {
+        self.layer(owner).map_or(time, |l| l.comp_time(time))
+    }
     pub fn new(width: u32, height: u32, frame_rate: FrameRate, duration: Tick) -> Comp {
         Comp {
             width,
@@ -520,6 +547,8 @@ impl Comp {
             background: [0.0, 0.0, 0.0],
             work_area: (Tick::ZERO, duration),
             layers: vec![],
+            rigs2d: vec![],
+            timeline_groups: vec![],
             markers: vec![],
             shutter_angle: 180.0,
             shutter_phase: -90.0,
@@ -850,6 +879,8 @@ impl Comp {
             background,
             work_area,
             layers,
+            rigs2d,
+            timeline_groups: _,
             markers,
             shutter_angle,
             shutter_phase,
@@ -891,6 +922,8 @@ impl Comp {
             && *global_light == o.global_light
             && *guides == o.guides
             && *essential == o.essential
+            && rigs2d.len() == o.rigs2d.len()
+            && rigs2d.iter().zip(&o.rigs2d).all(|(a, b)| a.same_pixels(b))
             && layers.len() == o.layers.len()
             && layers.iter().zip(&o.layers).all(|(a, b)| a.same_pixels(b))
     }
@@ -1378,7 +1411,7 @@ impl Default for Project {
 }
 
 impl Project {
-    /// Allocate an id (items, layers and property uids share one counter).
+    /// Allocate an id (items, layers, rigs and property uids share one counter).
     pub fn alloc(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -1479,6 +1512,12 @@ impl Project {
             // Saturating: a damaged file's ids must not overflow (the import then refuses it).
             m = m.max(id.0.saturating_add(1));
             if let ItemKind::Comp(c) = &it.kind {
+                for rig in &c.rigs2d {
+                    m = m.max(rig.id.0.saturating_add(1)).max(rig.target.uid.saturating_add(1));
+                }
+                for group in &c.timeline_groups {
+                    m = m.max(group.id.0.saturating_add(1));
+                }
                 for l in &c.layers {
                     m = m.max(l.id.0.saturating_add(1)).max(l.props.max_uid().saturating_add(1));
                 }
@@ -1547,10 +1586,23 @@ impl Project {
         if p.schema > SCHEMA_VERSION {
             return Err(ProjectError::Invalid(format!("project schema {} is newer than this version supports ({SCHEMA_VERSION})", p.schema)));
         }
+        let mut notes = timeline_groups::prune(&mut p);
+        rig2d::validate_project(&p)?;
         p.fix_next_id();
-        let mut notes = vec![];
         for item in p.items.values_mut() {
             limits::repair_item(item, &mut notes);
+            if let ItemKind::Comp(comp) = &mut item.kind
+                && comp.rigs2d.iter().any(|rig| rig.bind_target.is_none())
+            {
+                for rig in &mut Arc::make_mut(comp).rigs2d {
+                    if rig.bind_target.is_none()
+                        && let Value::Vec2(target) = &rig.target.value
+                    {
+                        rig.bind_target = Some(*target);
+                        notes.push(format!("{}: initialized the original target of 2D rig {}", item.name, rig.id.0));
+                    }
+                }
+            }
         }
         Ok((p, notes))
     }

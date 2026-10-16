@@ -10,6 +10,33 @@ use crate::{EngineError, KeyRef, Result, Session, VertexRef, cmd, query};
 
 /// Resolve `{layer, path}` (or `{layer, prop: uid}`) to (comp, layer, prop uid).
 pub(crate) fn prop_ref(s: &Session, p: &Value, cmd: &str) -> Result<(ItemId, LayerId, Uid)> {
+    if let Some(id) = p.get("rig") {
+        if !matches!(
+            cmd,
+            "prop.get"
+                | "prop.set"
+                | "prop.toggleAnimation"
+                | "prop.addKey"
+                | "prop.toggleKey"
+                | "prop.select"
+                | "prop.deselect"
+                | "keys.select"
+                | "keys.copyValue"
+                | "keys.pasteValue"
+        ) {
+            return Err(bad(cmd, "this operation is not supported for IK controls"));
+        }
+        if p.get("layer").is_some() || p.get("layers").is_some() {
+            return Err(bad(cmd, "choose either a rig or a layer owner"));
+        }
+        let cid = comp_id(s, p)?;
+        let id = id.as_u64().ok_or_else(|| bad(cmd, "rig must be an id"))?;
+        let rig = s.project.comp(cid).and_then(|c| c.rigs2d.iter().find(|r| r.id.0 == id)).ok_or_else(|| bad(cmd, "rig not found"))?;
+        if p.get("prop").is_some_and(|u| u.as_u64() != Some(rig.target.uid)) || p.get("path").is_some_and(|v| v.as_str() != Some("position")) {
+            return Err(bad(cmd, "rig controls expose only their target Position property"));
+        }
+        return Ok((cid, LayerId(id), rig.target.uid));
+    }
     let (cid, lid) = layer_p(s, p, cmd)?;
     let layer = s.project.comp(cid).and_then(|c| c.layer(lid)).ok_or(EngineError::NoComp)?;
     if let Some(u) = p.get("prop").and_then(Value::as_u64) {
@@ -45,21 +72,109 @@ fn with_prop<T>(
     let t = s.time_of(cid);
     let linear = s.prefs.general.default_spatial_linear;
     s.edit(label, merge, |proj, _| {
-        let l = layer_mut(proj, cid, lid)?;
-        let lt = l.layer_time(t);
-        let pr = l.props.find_mut(uid).ok_or_else(|| bad("prop", "property vanished"))?;
+        let c = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
+        let lt = c.animation_time(lid, t);
+        let pr = c.animation_property_mut(lid, uid).ok_or_else(|| bad("prop", "property vanished"))?;
         let before: Vec<Tick> = pr.keys.iter().map(|k| k.time).collect();
         let r = f(pr, lt)?;
         // Settings ▸ General ▸ Default Spatial Interpolation to Linear: new keys of spatial
         // properties get straight motion paths instead of Auto Bezier.
-        if linear && pr.spatial {
-            for k in pr.keys.iter_mut().filter(|k| !before.contains(&k.time)) {
-                k.spatial_auto = false;
-                k.spatial_in = [0.0; 3];
-                k.spatial_out = [0.0; 3];
-            }
-        }
+        new_key_defaults(pr, &before, linear);
         Ok(r)
+    })
+}
+
+pub(crate) fn new_key_defaults(pr: &mut Property, before: &[Tick], linear: bool) {
+    if linear && pr.spatial {
+        for k in pr.keys.iter_mut().filter(|k| !before.contains(&k.time)) {
+            k.spatial_auto = false;
+            k.spatial_in = [0.0; 3];
+            k.spatial_out = [0.0; 3];
+        }
+    }
+}
+
+/// Resolve an explicit property owner, or one selected key. Stored key times are
+/// read without frame snapping: replacing a value must never retime a subframe key.
+fn value_key_ref(s: &Session, p: &Value, cmd: &str, copy: bool) -> Result<(ItemId, LayerId, Uid, Tick)> {
+    if ["layer", "rig", "prop", "path"].iter().any(|k| p.get(k).is_some()) {
+        let (cid, owner, uid) = prop_ref(s, p, cmd)?;
+        let c = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+        let at = if let Some(l) = c.layer(owner) {
+            key_time(l, c.frame_rate, p, "time", KeyTimeBase::from_params(p, cmd)?, cmd, false)?
+        } else {
+            control_time(p, c.frame_rate, cmd, false)?
+        };
+        if copy && at.is_none() {
+            return Err(bad(cmd, "give the source key time"));
+        }
+        let time = if let Some(time) = at {
+            time
+        } else if let Some(layer) = c.layer(owner) {
+            key_time(layer, c.frame_rate, &json!({"time":s.time_of(cid).seconds()}), "time", KeyTimeBase::Comp, cmd, false)?
+                .ok_or_else(|| bad(cmd, "current time is unavailable"))?
+        } else {
+            s.time_of(cid)
+        };
+        return Ok((cid, owner, uid, time));
+    }
+    if let [key] = s.state.selected_keys.as_slice() {
+        return Ok((s.active_comp_id().ok_or(EngineError::NoComp)?, key.layer, key.prop, key.time));
+    }
+    Err(bad(cmd, "choose one keyframe, or provide a property owner and time"))
+}
+
+fn copy_key_value(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "keys.copyValue";
+    let (cid, owner, uid, time) = value_key_ref(s, p, CMD, true)?;
+    let c = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let pr = c.animation_property(owner, uid).ok_or_else(|| bad(CMD, "property not found"))?;
+    let key = pr.keys.iter().find(|k| k.time == time).ok_or_else(|| bad(CMD, "no source keyframe at this time"))?;
+    let value = key.value.clone();
+    let path = c.layer(owner).and_then(|l| l.props.match_path_of(uid)).unwrap_or_else(|| pr.match_id.clone());
+    super::edit::clear_clipboards(s);
+    s.state.value_clipboard = vec![(path, value.clone())];
+    Ok(value.to_json())
+}
+
+fn has_value_clip(s: &Session) -> std::result::Result<(), String> {
+    has_comp(s)?;
+    if s.state.value_clipboard.len() == 1 { Ok(()) } else { Err("copy one keyframe value first".into()) }
+}
+
+fn paste_key_value(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "keys.pasteValue";
+    let [(_, value)] = s.state.value_clipboard.as_slice() else { return Err(bad(CMD, "copy one keyframe value first")) };
+    let value = value.clone();
+    let (cid, owner, uid, time) = value_key_ref(s, p, CMD, false)?;
+    let c = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let pr = c.animation_property(owner, uid).ok_or_else(|| bad(CMD, "property not found"))?;
+    if pr.static_only {
+        return Err(bad(CMD, "this property cannot have keyframes"));
+    }
+    if std::mem::discriminant(&pr.value) != std::mem::discriminant(&value) {
+        return Err(bad(CMD, format!("copied {} value is incompatible with {}", value.kind_name(), pr.value.kind_name())));
+    }
+    // Locks belong to actual layers, including the bones of a rig control.
+    if c.layer(owner).is_some_and(|l| l.switches.locked)
+        || c.rigs2d.iter().find(|r| r.id.0 == owner.0).is_some_and(|r| r.layers.iter().any(|id| c.layer(*id).is_none_or(|l| l.switches.locked)))
+    {
+        return Err(bad(CMD, "unlock the target layer or rig bones before pasting"));
+    }
+    let out = value.to_json();
+    with_prop(s, "Paste Keyframe Value", None, cid, owner, uid, |pr, _| {
+        if let Some(key) = pr.keys.iter_mut().find(|k| k.time == time) {
+            // Do not reconstruct this key: keep time, interpolation, easing,
+            // tangents, roving, labels and all other destination metadata intact.
+            key.value = value;
+        } else {
+            let mut key = Keyframe::new(time, value);
+            if pr.hold_only {
+                key = key.hold();
+            }
+            set_key(&mut pr.keys, key);
+        }
+        Ok(out)
     })
 }
 
@@ -151,8 +266,25 @@ fn key_reply(p: &Value, mut timing: Value, field: &str, result: Value) -> Value 
 fn snapped_key_time(s: &Session, cid: ItemId, lid: LayerId, p: &Value, cmd: &str) -> Result<Option<Tick>> {
     let base = KeyTimeBase::from_params(p, cmd)?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
-    let layer = comp.layer(lid).ok_or(EngineError::NoComp)?;
+    let Some(layer) = comp.layer(lid) else {
+        return control_time(p, comp.frame_rate, cmd, true);
+    };
     key_time(layer, comp.frame_rate, p, "time", base, cmd, true)
+}
+
+fn control_time(p: &Value, rate: FrameRate, cmd: &str, snap: bool) -> Result<Option<Tick>> {
+    KeyTimeBase::from_params(p, cmd)?;
+    let Some(value) = p.get("time") else { return Ok(None) };
+    let seconds = value
+        .as_f64()
+        .filter(|t| t.is_finite() && *t >= Tick::MIN.seconds() && *t <= Tick::MAX.seconds())
+        .ok_or_else(|| bad(cmd, "time must be finite seconds within the supported range"))?;
+    let time = Tick::from_seconds_f64(seconds);
+    let time = if snap { rate.snap_nearest(time) } else { time };
+    if !(Tick::MIN.0..=Tick::MAX.0).contains(&time.0) {
+        return Err(bad(cmd, "time snaps outside the supported range"));
+    }
+    Ok(Some(time))
 }
 
 fn property_reply(p: &Value, layer: &Layer, pr: &Property, time: Tick, value: Value) -> Value {
@@ -386,6 +518,9 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     if p.get("timeBase").is_none() {
         return Ok(out);
     }
+    if p.get("rig").is_some() {
+        return Ok(json!({"value":out,"compTime":at.unwrap_or_else(||s.time_of(cid)).seconds()}));
+    }
     let layer = s.project.comp(cid).and_then(|c| c.layer(lid)).ok_or(EngineError::NoComp)?;
     let pr = layer.props.find(uid).ok_or_else(|| bad("prop.set", "property vanished"))?;
     Ok(property_reply(p, layer, pr, at.unwrap_or_else(|| layer.layer_time(s.time_of(cid))), out))
@@ -394,6 +529,17 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
 /// Read one property: value at `time` (comp seconds, default the CTI), keyframes and expression.
 fn get(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, lid, uid) = prop_ref(s, p, "prop.get")?;
+    if p.get("rig").is_some() {
+        let c = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+        let pr = c.animation_property(lid, uid).ok_or_else(|| bad("prop.get", "property vanished"))?;
+        let time = control_time(p, c.frame_rate, "prop.get", false)?.unwrap_or_else(|| s.time_of(cid));
+        let keys: Vec<_> = pr
+            .keys
+            .iter()
+            .map(|k| json!({"time":k.time.seconds(),"compTime":k.time.seconds(),"value":k.value.to_json(),"in":k.in_interp.label(),"out":k.out_interp.label()}))
+            .collect();
+        return Ok(json!({"rig":lid.0,"uid":uid,"value":pr.value_at(time).to_json(),"animated":pr.is_animated(),"time":time.seconds(),"keys":keys}));
+    }
     let l = s.project.comp(cid).and_then(|c| c.layer(lid)).ok_or(EngineError::NoComp)?;
     let pr = l.props.find(uid).ok_or_else(|| bad("prop.get", "property vanished"))?;
     let t = f_p(p, "time").map(Tick::from_seconds_f64).unwrap_or_else(|| s.time_of(cid));
@@ -472,6 +618,9 @@ fn add_key(s: &mut Session, p: &Value) -> Result<Value> {
     if p.get("timeBase").is_none() {
         return Ok(count);
     }
+    if p.get("rig").is_some() {
+        return Ok(json!({"count":count,"compTime":at.unwrap_or_else(||s.time_of(cid)).seconds()}));
+    }
     let layer = s.project.comp(cid).and_then(|c| c.layer(lid)).ok_or(EngineError::NoComp)?;
     Ok(key_reply(p, key_timing(layer, at.unwrap_or_else(|| layer.layer_time(s.time_of(cid)))), "count", count))
 }
@@ -482,7 +631,7 @@ fn toggle_key(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// Add a keyframe at layer time `lt` (true), or remove the one there (false).
-fn toggle_key_at(pr: &mut Property, lt: Tick) -> bool {
+pub(crate) fn toggle_key_at(pr: &mut Property, lt: Tick) -> bool {
     if let Some(i) = key_at(&pr.keys, lt) {
         if pr.keys.len() == 1 {
             pr.value = pr.keys[0].value.clone();
@@ -643,6 +792,21 @@ fn reset(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn select_prop(s: &mut Session, p: &Value) -> Result<Value> {
+    if p.get("rig").is_some() {
+        let (cid, owner, uid) = prop_ref(s, p, "prop.select")?;
+        s.execute("rig.select2d", json!({"rig":owner.0,"timeline":true}))?;
+        s.state.selected_props = vec![(owner, uid)];
+        if b_p(p, "selectKeys").unwrap_or(true) {
+            s.state.selected_keys = s
+                .project
+                .comp(cid)
+                .and_then(|c| c.animation_property(owner, uid))
+                .map(|pr| pr.keys.iter().map(|k| KeyRef { layer: owner, prop: uid, time: k.time }).collect())
+                .unwrap_or_default();
+        }
+        return Ok(Value::Null);
+    }
+    s.state.selected_rig2d = None;
     let (_, lid) = layer_p(s, p, "prop.select")?;
     let uid = match p.get("prop").and_then(Value::as_u64) {
         Some(u) => u,
@@ -680,6 +844,12 @@ fn select_prop(s: &mut Session, p: &Value) -> Result<Value> {
 /// Deselect only the named property, preserving unrelated property, layer, key and
 /// mask-vertex selections. Selected keys also imply selectedProperties in the script API.
 fn deselect_prop(s: &mut Session, params: &Value) -> Result<Value> {
+    if params.get("rig").is_some() {
+        let (_, owner, uid) = prop_ref(s, params, "prop.deselect")?;
+        s.state.selected_props.retain(|(o, u)| *o != owner || *u != uid);
+        s.state.selected_keys.retain(|k| k.layer != owner || k.prop != uid);
+        return Ok(Value::Null);
+    }
     // Groups (masks, effects) are selected by uid too, so resolve the uid as prop.select does.
     let (_, lid) = layer_p(s, params, "prop.deselect")?;
     let uid = match params.get("prop").and_then(Value::as_u64) {
@@ -720,6 +890,18 @@ fn select_keys(s: &mut Session, p: &Value) -> Result<Value> {
     let mut sel = vec![];
     if let Some(Value::Array(keys)) = p.get("keys") {
         for k in keys {
+            if k.get("rig").is_some() {
+                let (cid, owner, uid) = prop_ref(s, k, "keys.select")?;
+                if Some(cid) != s.active_comp_id() {
+                    return Err(bad("keys.select", "rig must belong to active composition"));
+                }
+                let pr = comp.animation_property(owner, uid).ok_or_else(|| bad("keys.select", "property vanished"))?;
+                let time = control_time(k, comp.frame_rate, "keys.select", false)?.ok_or_else(|| bad("keys.select", "missing time"))?;
+                let i = key_at(&pr.keys, time).ok_or_else(|| bad("keys.select", "no key at this time"))?;
+                let key = pr.keys.get(i).ok_or_else(|| bad("keys.select", "key vanished"))?;
+                sel.push(KeyRef { layer: owner, prop: uid, time: key.time });
+                continue;
+            }
             // `{layer, prop: uid | path, time}` (or `path`); anything that matches nothing is an
             // error rather than a silently empty selection.
             let lv = k.get("layer").ok_or_else(|| bad("keys.select", format!("{k}: missing `layer`")))?;
@@ -744,7 +926,8 @@ fn select_keys(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     // Keys of locked layers can't be selected (so nothing edits them).
-    sel.retain(|k| comp.layer(k.layer).is_some_and(|l| !l.switches.locked));
+    sel.retain(|k| comp.layer(k.layer).map_or_else(|| comp.animation_property(k.layer, k.prop).is_some(), |l| !l.switches.locked));
+    let rig_ids: Vec<_> = comp.rigs2d.iter().map(|r| r.id).collect();
     if b_p(p, "toggle").unwrap_or(false) {
         // Shift+click: in and out of the selection.
         for k in sel {
@@ -772,12 +955,15 @@ fn select_keys(s: &mut Session, p: &Value) -> Result<Value> {
         if !extend {
             st.selected_props.clear();
             st.selected_layers.clear();
+            st.selected_rig2d = None;
         }
         for k in &st.selected_keys {
             if !st.selected_props.contains(&(k.layer, k.prop)) {
                 st.selected_props.push((k.layer, k.prop));
             }
-            if !st.selected_layers.contains(&k.layer) {
+            if let Some(r) = rig_ids.iter().find(|r| r.0 == k.layer.0) {
+                st.selected_rig2d = Some(*r);
+            } else if !st.selected_layers.contains(&k.layer) {
                 st.selected_layers.push(k.layer);
             }
         }
@@ -791,9 +977,14 @@ fn select_keys(s: &mut Session, p: &Value) -> Result<Value> {
         .selected_keys
         .iter()
         .filter_map(|k| {
-            let layer = comp.layer(k.layer)?;
-            let mut timing = key_timing(layer, k.time);
-            timing["layer"] = json!(k.layer.0);
+            let mut timing = if let Some(layer) = comp.layer(k.layer) {
+                let mut timing = key_timing(layer, k.time);
+                timing["layer"] = json!(k.layer.0);
+                timing
+            } else {
+                comp.animation_property(k.layer, k.prop)?;
+                json!({"rig":k.layer.0,"time":k.time.seconds(),"compTime":k.time.seconds()})
+            };
             timing["prop"] = json!(k.prop);
             Some(timing)
         })
@@ -818,7 +1009,7 @@ pub(crate) fn edit_keys(s: &mut Session, label: &str, merge: Option<&str>, f: im
             groups.entry((k.layer, k.prop)).or_default().push(k.time);
         }
         for ((lid, uid), times) in groups {
-            let Some(pr) = comp.layer_mut(lid).and_then(|l| l.props.find_mut(uid)) else { continue };
+            let Some(pr) = comp.animation_property_mut(lid, uid) else { continue };
             // Process each stored key once, in an order that avoids collisions when moving.
             let mut idx: Vec<(usize, Tick)> = times.iter().filter_map(|t| key_at(&pr.keys, *t).map(|i| (i, *t))).collect();
             idx.sort_by_key(|x| x.0);
@@ -883,21 +1074,21 @@ pub(crate) fn key_gesture(
 /// landing on another key of its property replaces it, roving keys follow their neighbours and
 /// keys of locked layers stay. Returns the keys' new references in `from`'s order: the selection
 /// keeps the order it was made in.
-pub(crate) fn move_key_refs(comp: &mut effectcraft_project::Comp, from: &[KeyRef], to: impl Fn(&Layer, Tick) -> Result<Tick>) -> Result<Vec<KeyRef>> {
+pub(crate) fn move_key_refs(comp: &mut effectcraft_project::Comp, from: &[KeyRef], to: impl Fn(Option<&Layer>, Tick) -> Result<Tick>) -> Result<Vec<KeyRef>> {
     let mut remapped: std::collections::HashMap<KeyRef, KeyRef> = Default::default();
     let mut groups: std::collections::BTreeMap<(LayerId, Uid), Vec<Tick>> = Default::default();
     for k in from {
         groups.entry((k.layer, k.prop)).or_default().push(k.time);
     }
     for ((lid, uid), times) in groups {
-        let Some(l) = comp.layer_mut(lid) else { continue };
         let at = |time| KeyRef { layer: lid, prop: uid, time };
-        if l.switches.locked {
+        let layer = comp.layer(lid);
+        if layer.is_some_and(|l| l.switches.locked) {
             remapped.extend(times.iter().map(|t| (at(*t), at(*t))));
             continue;
         }
-        let moves: Vec<(Tick, Tick)> = times.iter().map(|t| Ok((*t, to(l, *t)?))).collect::<Result<_>>()?;
-        let Some(pr) = l.props.find_mut(uid) else { continue };
+        let moves: Vec<(Tick, Tick)> = times.iter().map(|t| Ok((*t, to(layer, *t)?))).collect::<Result<_>>()?;
+        let Some(pr) = comp.animation_property_mut(lid, uid) else { continue };
         // Take the moving keys out, then put them back at their new times.
         let mut moved = vec![];
         for (old, new) in &moves {
@@ -949,7 +1140,14 @@ pub(crate) fn shift_keys(s: &mut Session, label: &str, merge: Option<&str>, d: T
         }
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
         let d = comp.frame_rate.snap_nearest(total);
-        st.selected_keys = move_key_refs(comp, &from, |l, t| Ok(t + layer_shift(l, d)))?;
+        st.selected_keys = move_key_refs(comp, &from, |l, t| {
+            let shift = l.map_or(d, |l| layer_shift(l, d));
+            let ticks =
+                t.0.checked_add(shift.0)
+                    .filter(|t| (Tick::MIN.0..=Tick::MAX.0).contains(t))
+                    .ok_or_else(|| bad("keys.move", "key moves outside the supported time range"))?;
+            Ok(Tick(ticks))
+        })?;
         Ok(json!(st.selected_keys.len()))
     })?;
     // Only a step that applied counts towards the drag.
@@ -958,7 +1156,10 @@ pub(crate) fn shift_keys(s: &mut Session, label: &str, merge: Option<&str>, d: T
 }
 
 fn move_keys(s: &mut Session, p: &Value) -> Result<Value> {
-    let d = Tick::from_seconds_f64(f_p(p, "delta").ok_or_else(|| bad("keys.move", "missing `delta` (seconds)"))?);
+    let delta = f_p(p, "delta")
+        .filter(|v| v.is_finite() && *v >= Tick::MIN.seconds() && *v <= Tick::MAX.seconds())
+        .ok_or_else(|| bad("keys.move", "delta must be finite seconds within the supported time range"))?;
+    let d = Tick::from_seconds_f64(delta);
     shift_keys(s, "Move Keyframes", merge_p(p), d)
 }
 
@@ -968,7 +1169,7 @@ fn delete_keys(s: &mut Session, _: &Value) -> Result<Value> {
     s.edit("Delete Keyframes", None, |proj, st| {
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
         for k in &sel {
-            if let Some(pr) = comp.layer_mut(k.layer).and_then(|l| l.props.find_mut(k.prop))
+            if let Some(pr) = comp.animation_property_mut(k.layer, k.prop)
                 && let Some(i) = key_at(&pr.keys, k.time)
             {
                 if pr.keys.len() == 1 {
@@ -1223,19 +1424,45 @@ fn convert_one_expr(s: &mut Session, cid: ItemId, lid: LayerId, uid: Uid) -> Res
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
-        query!("prop.get", "Get Property", "{layer?, path|prop, time? (comp s)}", get),
+        cmd!(
+            "keys.copyValue",
+            "Copy Value",
+            [],
+            None,
+            "{layer? | rig?, path|prop, time? (stored time; rig: comp s), timeBase?} or one selected key",
+            has_comp,
+            copy_key_value
+        ),
+        cmd!(
+            "keys.pasteValue",
+            "Paste Value",
+            [],
+            None,
+            "{layer? | rig?, path|prop, time?, timeBase?} or one selected key; no explicit time creates/updates a key at the CTI",
+            has_value_clip,
+            paste_key_value
+        ),
+        query!("prop.get", "Get Property", "{layer? | rig?, path|prop, time? (comp s)}", get),
         cmd!(
             "prop.set",
             "Set Property Value",
             [],
             None,
-            "{layer?, path|prop, value, time? (layer s by default), timeBase?: layer|comp, merge?, selected? (also the other selected layers), offset? (them by the same change), proportional? (with offset: Proportional Scrubbing, each layer by its share in selection order, the first none, the last all)}",
+            "{layer? | rig?, path|prop, value, time? (layer s by default), timeBase?: layer|comp, merge?, selected? (also the other selected layers), offset? (them by the same change), proportional? (with offset: Proportional Scrubbing, each layer by its share in selection order, the first none, the last all)}",
             has_layers,
             set_selected
         ),
-        cmd!("prop.toggleAnimation", "Toggle Stopwatch", [], None, "{layer?, path|prop, value?, merge?, selected?}", has_layers, toggle_anim_selected),
-        cmd!("prop.addKey", "Add Keyframe", [], None, "{layer?, path|prop, time? (layer s by default), timeBase?: layer|comp, value?}", has_layers, add_key),
-        cmd!("prop.toggleKey", "Add or Remove Keyframe at Current Time", [], None, "{layer?, path|prop, selected?}", has_layers, toggle_key_selected),
+        cmd!("prop.toggleAnimation", "Toggle Stopwatch", [], None, "{layer? | rig?, path|prop, value?, merge?, selected?}", has_layers, toggle_anim_selected),
+        cmd!(
+            "prop.addKey",
+            "Add Keyframe",
+            [],
+            None,
+            "{layer? | rig?, path|prop, time? (layer s by default), timeBase?: layer|comp, value?}",
+            has_layers,
+            add_key
+        ),
+        cmd!("prop.toggleKey", "Add or Remove Keyframe at Current Time", [], None, "{layer? | rig?, path|prop, selected?}", has_layers, toggle_key_selected),
         cmd!(
             "keys.toggleTransform",
             "Add or Remove Transform Keyframe",
@@ -1263,8 +1490,8 @@ pub fn specs() -> Vec<CommandSpec> {
             has_layers,
             reset
         ),
-        cmd!("prop.select", "Select Property", [], None, "{layer?, path|prop, add?, selectKeys?}", has_layers, select_prop),
-        cmd!("prop.deselect", "Deselect Property", [], None, "{layer?, path|prop}", has_layers, deselect_prop),
+        cmd!("prop.select", "Select Property", [], None, "{layer? | rig?, path|prop, add?, selectKeys?}", has_layers, select_prop),
+        cmd!("prop.deselect", "Deselect Property", [], None, "{layer? | rig?, path|prop}", has_layers, deselect_prop),
         cmd!(
             "prop.convertExpressionToKeyframes",
             "Convert Expression to Keyframes",
@@ -1279,7 +1506,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Select Keyframes",
             [],
             None,
-            "{keys: [{layer, prop: uid | path (or `path`), time (layer s by default)}], timeBase?: layer|comp, add?, toggle?: bool (Shift+click: in or out of the selection), selectProperties?: bool (their properties and layers too, as a Timeline click does)}",
+            "{keys: [{layer | rig, prop: uid | path (or `path`), time (layer s by default; rig keys always comp s)}], timeBase?: layer|comp, add?, toggle?: bool (Shift+click: in or out of the selection), selectProperties?: bool}",
             has_comp,
             select_keys
         ),

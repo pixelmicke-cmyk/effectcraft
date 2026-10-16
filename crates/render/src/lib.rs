@@ -17,6 +17,7 @@ use color::Region;
 pub mod eval;
 pub mod masks;
 pub mod passes;
+pub mod rig2d;
 pub mod shapes;
 pub mod styles;
 pub mod text;

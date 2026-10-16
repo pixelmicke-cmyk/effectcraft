@@ -708,7 +708,7 @@ pub fn with_overrides(project: &Project, comp: ItemId, overrides: &[Override]) -
 
 // ------------------------------------------------------------------------------ id remapping
 
-/// Shift every id (items, layers, property uids, Essential Graphics controls) of `p` by
+/// Shift every id (items, layers, rigs, property uids, Essential Graphics controls) of `p` by
 /// `offset`, keeping all references consistent: used when merging a template or another project
 /// into a project. Ids from a damaged file saturate instead of overflowing.
 pub fn offset_ids(p: &mut Project, offset: u64) {
@@ -720,6 +720,19 @@ pub fn offset_ids(p: &mut Project, offset: u64) {
             let c = std::sync::Arc::make_mut(c);
             for l in &mut c.layers {
                 offset_layer(l, offset);
+            }
+            for rig in &mut c.rigs2d {
+                rig.id.0 = rig.id.0.saturating_add(offset);
+                rig.target.uid = rig.target.uid.saturating_add(offset);
+                for layer in &mut rig.layers {
+                    layer.0 = layer.0.saturating_add(offset);
+                }
+            }
+            for group in &mut c.timeline_groups {
+                group.id.0 = group.id.0.saturating_add(offset);
+                for layer in &mut group.layers {
+                    layer.0 = layer.0.saturating_add(offset);
+                }
             }
             if let Some(eg) = &mut c.essential {
                 fn go(v: &mut [EgControl], o: u64) {

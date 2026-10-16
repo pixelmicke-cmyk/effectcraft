@@ -192,6 +192,9 @@ async fn export_with(cx: &Cx<'_>, progress: &mut dyn FnMut(&Progress) -> bool, t
     let total = cx.settings.frame_count(comp);
     let mut st = State { t0, total, done: 0, progress };
     st.advance(0)?;
+    if !matches!(cx.output.format, OutputFormat::Wav | OutputFormat::Aiff) {
+        cx.validate_rigs(comp, total, st.progress)?;
+    }
     let (w, h) = output_size(comp, cx.settings, cx.output);
     let mut report = match cx.output.format {
         OutputFormat::H264 | OutputFormat::Hevc | OutputFormat::Av1 | OutputFormat::ProRes | OutputFormat::Uncompressed => {

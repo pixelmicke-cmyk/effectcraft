@@ -157,7 +157,8 @@ pub trait Importer: Send + Sync {
     fn add_frames(&self, _paths: &[String]) {}
 }
 
-/// A keyframe reference: layer, property uid, key time (layer time).
+/// A keyframe reference. `layer` is the legacy animation-owner ID field:
+/// layer or rig (global ID namespace); rig key times are composition time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct KeyRef {
     pub layer: LayerId,
@@ -198,6 +199,8 @@ pub struct VertexRef {
 /// (and the property, key, and vertex lists); every other comp keeps its own here (#1001).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CompSelection {
+    #[serde(default)]
+    pub rig2d: Option<effectcraft_project::rig2d::RigId>,
     pub layers: Vec<LayerId>,
     pub props: Vec<(LayerId, Uid)>,
     pub keys: Vec<KeyRef>,
@@ -206,7 +209,7 @@ pub struct CompSelection {
 
 impl CompSelection {
     fn is_empty(&self) -> bool {
-        self.layers.is_empty() && self.props.is_empty() && self.keys.is_empty() && self.vertices.is_empty()
+        self.rig2d.is_none() && self.layers.is_empty() && self.props.is_empty() && self.keys.is_empty() && self.vertices.is_empty()
     }
 }
 
@@ -223,6 +226,9 @@ pub struct EditorState {
     pub times: std::collections::BTreeMap<ItemId, Tick>,
     /// Layer selection of the active comp. Other comps' selections are in [`Self::comp_selections`].
     pub selected_layers: Vec<LayerId>,
+    /// A composition viewer IK control, selected independently of its image layers.
+    #[serde(default)]
+    pub selected_rig2d: Option<effectcraft_project::rig2d::RigId>,
     /// Selections of comps that are not active, keyed by comp id (#1001).
     #[serde(default)]
     pub comp_selections: std::collections::BTreeMap<ItemId, CompSelection>,
@@ -622,7 +628,7 @@ impl Session {
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         if let Err(why) = (spec.enabled)(self) {
             // Explicit targets (agents, scripts) don't need a UI selection.
-            let explicit = (["layer", "layers", "prop", "keys"].iter().any(|k| params.get(k).is_some()) && commands::has_comp(self).is_ok())
+            let explicit = (["layer", "layers", "prop", "keys", "rig"].iter().any(|k| params.get(k).is_some()) && commands::has_comp(self).is_ok())
                 || ["item", "items"].iter().any(|k| params.get(k).is_some())
                 // An explicit composition (the enablement looks at the active one).
                 || params.get("comp").is_some_and(|c| !c.is_null() && self.resolve_comp(Some(c)).is_ok());
@@ -676,6 +682,7 @@ impl Session {
         let mut p = (*self.project).clone();
         let mut st = self.state.clone();
         let r = f(&mut p, &mut st)?;
+        effectcraft_project::timeline_groups::prune(&mut p);
         // Layer styles: one Global Light per comp, whichever layer edited it.
         effectcraft_project::styles::sync_global_light(&before, &mut p);
         // Essential Properties of precomp layers follow their comps' Essential Graphics.
@@ -784,13 +791,20 @@ impl Session {
     /// counts only inside the comp that owns it, so the active comp never sees another comp's layers.
     pub fn sanitize_state(&mut self) {
         let p = self.project.clone();
+        if self.state.selected_rig2d.is_some_and(|id| self.active_comp().is_none_or(|c| !c.rigs2d.iter().any(|r| r.id == id))) {
+            self.state.selected_rig2d = None;
+        }
         self.state.open_comps.retain(|c| p.comp(*c).is_some());
         self.state.comp_selections.retain(|cid, sel| {
             let Some(c) = p.comp(*cid) else { return false };
             let ids: Vec<LayerId> = c.layers.iter().map(|l| l.id).collect();
+            let owners: Vec<_> = ids.iter().copied().chain(c.rigs2d.iter().map(|r| LayerId(r.id.0))).collect();
             sel.layers.retain(|l| ids.contains(l));
-            sel.props.retain(|(l, _)| ids.contains(l));
-            sel.keys.retain(|k| ids.contains(&k.layer));
+            if sel.rig2d.is_some_and(|id| !c.rigs2d.iter().any(|r| r.id == id)) {
+                sel.rig2d = None;
+            }
+            sel.props.retain(|(l, _)| owners.contains(l));
+            sel.keys.retain(|k| owners.contains(&k.layer));
             sel.vertices.retain(|v| ids.contains(&v.layer));
             !sel.is_empty()
         });
@@ -803,9 +817,10 @@ impl Session {
         }
         if let Some(c) = self.active_comp() {
             let ids: Vec<LayerId> = c.layers.iter().map(|l| l.id).collect();
+            let owners: Vec<_> = ids.iter().copied().chain(c.rigs2d.iter().map(|r| LayerId(r.id.0))).collect();
             self.state.selected_layers.retain(|l| ids.contains(l));
-            self.state.selected_props.retain(|(l, _)| ids.contains(l));
-            self.state.selected_keys.retain(|k| ids.contains(&k.layer));
+            self.state.selected_props.retain(|(l, _)| owners.contains(l));
+            self.state.selected_keys.retain(|k| owners.contains(&k.layer));
             self.state.selected_vertices.retain(|v| ids.contains(&v.layer));
         }
         if let Some((l, t)) = self.state.current_track
@@ -929,6 +944,7 @@ impl Session {
     fn remember_selection(&mut self) {
         let Some(id) = self.state.active_comp else { return };
         let sel = CompSelection {
+            rig2d: self.state.selected_rig2d,
             layers: self.state.selected_layers.clone(),
             props: self.state.selected_props.clone(),
             keys: self.state.selected_keys.clone(),
@@ -944,6 +960,7 @@ impl Session {
     fn recall_selection(&mut self, id: ItemId) {
         match self.state.comp_selections.remove(&id) {
             Some(sel) => {
+                self.state.selected_rig2d = sel.rig2d;
                 self.state.selected_layers = sel.layers;
                 self.state.selected_props = sel.props;
                 self.state.selected_keys = sel.keys;
@@ -954,6 +971,7 @@ impl Session {
     }
 
     fn clear_live_selection(&mut self) {
+        self.state.selected_rig2d = None;
         self.state.selected_layers.clear();
         self.state.selected_props.clear();
         self.state.selected_keys.clear();
@@ -1040,6 +1058,9 @@ impl Session {
     /// so the longest side is at most `max_side` pixels (0 = full size). Returns (width, height, rgba).
     pub fn render_rgba8(&self, comp: ItemId, t: Tick, max_side: u32) -> Result<(u32, u32, Vec<u8>)> {
         let c = self.project.comp(comp).ok_or(EngineError::NoComp)?;
+        let mut validator = effectcraft_render::Renderer::new(&self.project, self.footage.as_ref(), RenderOpts::default());
+        validator.expr = self.expr.as_deref();
+        validator.validate_rigs(comp, t).map_err(EngineError::Other)?;
         let long = c.width.max(c.height).max(1) as f64;
         let scale = if max_side == 0 { 1.0 } else { (max_side as f64 / long).min(1.0) };
         let img = self.render(comp, t, RenderOpts { scale, backend: effectcraft_render::Backend::Auto, ..Default::default() });
@@ -1101,6 +1122,9 @@ impl Session {
             return self.render_rgba8(comp, t, max_side);
         }
         let c = self.project.comp(comp).ok_or(EngineError::NoComp)?;
+        let mut validator = effectcraft_render::Renderer::new(&self.project, self.footage.as_ref(), RenderOpts::default());
+        validator.expr = self.expr.as_deref();
+        validator.validate_rigs(comp, t).map_err(EngineError::Other)?;
         let long = c.width.max(c.height).max(1) as f64;
         let scale = if max_side == 0 { 1.0 } else { (max_side as f64 / long).min(1.0) };
         let img = self.render(comp, t, RenderOpts { scale, backend: effectcraft_render::Backend::Auto, ..Default::default() });

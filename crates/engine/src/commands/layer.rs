@@ -317,6 +317,7 @@ fn select(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let add = b_p(p, "add").unwrap_or(false);
     let toggle = b_p(p, "toggle").unwrap_or(false);
+    s.state.selected_rig2d = None;
     if toggle {
         for id in ids {
             if let Some(i) = s.state.selected_layers.iter().position(|l| *l == id) {
@@ -852,7 +853,7 @@ pub(crate) fn parent_fixes(s: &Session, cid: ItemId, ids: &[LayerId], parent: Op
 
 /// Validate the proposed ancestor chain before any authored edit, including when compensation
 /// is disabled. Bound both unique ancestors and linear lookup/selection work on loaded graphs.
-fn check_parent_chain(comp: &Comp, ids: &[LayerId], parent: Option<LayerId>, max_visits: usize, max_work: usize) -> Result<()> {
+pub(crate) fn check_parent_chain(comp: &Comp, ids: &[LayerId], parent: Option<LayerId>, max_visits: usize, max_work: usize) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
     let mut work = 0usize;
     let mut cur = parent;

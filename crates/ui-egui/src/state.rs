@@ -559,6 +559,8 @@ impl Default for AnimToolsState {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UiState {
+    #[serde(default)]
+    pub ik_connect: crate::panels::ik_connect::Draft,
     pub tool: Tool,
     /// Window ▸ Script Console input, output and history.
     #[serde(default)]
@@ -697,6 +699,7 @@ pub struct UiState {
 impl Default for UiState {
     fn default() -> Self {
         UiState {
+            ik_connect: Default::default(),
             tool: Tool::Selection,
             script_console: Default::default(),
             slot_tools: Tool::SLOTS.iter().map(|s| s[0]).collect(),

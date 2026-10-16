@@ -166,6 +166,29 @@ impl<'a> Cx<'a> {
         r
     }
 
+    /// Refuse unsupported IK before creating output files. Validate every field/frame
+    /// sample at its mapped nested time; ordinary projects pay no per-frame cost.
+    pub fn validate_rigs(&self, comp: &Comp, total: u64, progress: &mut dyn FnMut(&crate::Progress) -> bool) -> crate::Result<()> {
+        if self.project.comps().all(|(_, c)| c.rigs2d.is_empty()) {
+            return Ok(());
+        }
+        let renderer = self.renderer();
+        for i in 0..total {
+            if i % 256 == 0 && !progress(&crate::Progress { total, ..Default::default() }) {
+                return Err(crate::ExportError::Cancelled);
+            }
+            let times = match self.settings.sample(comp, i) {
+                FrameSample::Progressive(t) => [t, t],
+                FrameSample::Fields { first, second, .. } => [first, second],
+            };
+            renderer.validate_rigs(self.job.comp, times[0]).map_err(crate::ExportError::Unsupported)?;
+            if times[1] != times[0] {
+                renderer.validate_rigs(self.job.comp, times[1]).map_err(crate::ExportError::Unsupported)?;
+            }
+        }
+        Ok(())
+    }
+
     async fn render_at(&self, t: Tick) -> Image {
         // With deferred GPU readbacks (a browser worker) the frame renders in passes.
         effectcraft_render::passes::comp_frame(&self.renderer(), self.job.comp, t).await
@@ -661,6 +684,102 @@ mod tests {
         for y in 0..4u32 {
             assert_eq!(up.data[up.idx(1, y)][0], if y % 2 == 0 { 1.0 } else { 0.0 }, "upper first: line {y}");
             assert_eq!(lo.data[lo.idx(1, y)][0], if y % 2 == 1 { 1.0 } else { 0.0 }, "lower first: line {y}");
+        }
+    }
+
+    #[test]
+    fn ik_export_matches_common_evaluation_and_rejects_bad_rigs_before_writing() {
+        use effectcraft_color::Label;
+        use effectcraft_project::render_queue::{OutputFormat, OutputModule, RenderSettings};
+        use effectcraft_project::{ItemKind, LayerSource, Solid, Value, build, rig2d::Rig2d};
+        use effectcraft_render::NoFootage;
+        use effectcraft_time::FrameRate;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut p = Project::default();
+        let mut c = Comp::new(64, 48, FrameRate::FPS_25, Tick::from_seconds_f64(0.12));
+        let mut ids = vec![];
+        for (name, pos) in [("Upper", [20.0, 24.0, 0.0]), ("Lower", [10.0, 2.0, 0.0])] {
+            let sid = p.add_item(name, Label::Red, None, ItemKind::Solid(Solid { color: [1.0, 0.0, 0.0], width: 10, height: 4, pixel_aspect: 1.0 }));
+            let mut l = build::layer(&mut p, &c, name, LayerSource::Solid { item: sid }, (10, 4), None);
+            l.parent = ids.first().copied();
+            l.props.prop_mut("transform/anchor").unwrap().value = Value::Vec3([0.0, 2.0, 0.0]);
+            l.props.prop_mut("transform/position").unwrap().value = Value::Vec3(pos);
+            ids.push(l.id);
+            c.layers.push(l);
+        }
+        let mut rig = Rig2d::new(&mut p, [ids[0], ids[1]], [[20.0, 24.0], [30.0, 24.0], [40.0, 24.0]], [10.0, 2.0], [40.0, 24.0]).unwrap();
+        rig.target.value = Value::Vec2([28.0, 30.0]);
+        rig.target.set_animated(true, Tick::ZERO);
+        rig.target.set_value_at(Tick::from_seconds_f64(0.08), Value::Vec2([34.0, 30.0]));
+        c.rigs2d.push(rig);
+        let cid = p.add_item("Arm", Label::Sandstone, None, ItemKind::Comp(c.into()));
+        let (settings, mut output) = (RenderSettings::default(), OutputModule::for_format(OutputFormat::PngSequence));
+        output.channels = Channels::Rgba;
+        let writes = std::sync::Arc::new(AtomicUsize::new(0));
+        let count = writes.clone();
+        let pngs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = pngs.clone();
+        let sink = move |path: &str, bytes: Vec<u8>| {
+            // Error logs are intentional; failed validation must produce no image files.
+            if path.ends_with(".png") {
+                let rgba = image::load_from_memory(&bytes).unwrap().into_rgba8().into_raw();
+                captured.lock().unwrap().push((path.to_string(), rgba));
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        let job = Job {
+            project: &p,
+            footage: &NoFootage,
+            expr: None,
+            accel: None,
+            comp: cid,
+            settings: &settings,
+            output: &output,
+            path: "ik_[#####].png",
+            sink: Some(&sink),
+            nested_switches: true,
+            options: Default::default(),
+        };
+        let cx = Cx::new(&job);
+        let comp = cx.comp().unwrap();
+        cx.validate_rigs(comp, 3, &mut |_| true).unwrap();
+        for i in 0..3 {
+            let t = settings.frame_time(comp, i);
+            assert_eq!(cx.frame(comp, i).data, Renderer::new(&p, &NoFootage, RenderOpts::default()).comp_frame(cid, t).data);
+        }
+        assert_eq!(crate::export(&job, &mut |_| true).unwrap().frames, 3);
+        assert_eq!(writes.load(Ordering::SeqCst), 3);
+        let mut decoded = pngs.lock().unwrap();
+        decoded.sort_by(|a, b| a.0.cmp(&b.0));
+        for (i, (_, rgba)) in decoded.iter().enumerate() {
+            assert_eq!(*rgba, cx.pixels(&cx.frame(comp, i as u64), comp, Channels::Rgba, comp.width, comp.height));
+        }
+        assert_ne!(decoded[0].1, decoded[2].1, "the exported sequence must reflect target animation");
+        drop(decoded);
+        for later in [false, true] {
+            let mut bad = p.clone();
+            if later {
+                bad.comp_mut(cid).unwrap().rigs2d[0].target.keys.last_mut().unwrap().value = Value::Vec2([f64::NAN, 30.0]);
+            } else {
+                bad.comp_mut(cid).unwrap().layer_mut(ids[0]).unwrap().props.prop_mut("transform/scale").unwrap().value = Value::Vec3([0.0, 50.0, 100.0]);
+            }
+            writes.store(0, Ordering::SeqCst);
+            let job = Job {
+                project: &bad,
+                footage: &NoFootage,
+                expr: None,
+                accel: None,
+                comp: cid,
+                settings: &settings,
+                output: &output,
+                path: "ik_bad_[#####].png",
+                sink: Some(&sink),
+                nested_switches: true,
+                options: Default::default(),
+            };
+            let error = crate::export(&job, &mut |_| true).unwrap_err().to_string();
+            assert!(error.contains("2D IK"), "{error}");
+            assert_eq!(writes.load(Ordering::SeqCst), 0);
         }
     }
 

@@ -73,6 +73,7 @@ fn select_all(s: &mut Session, _: &Value) -> Result<Value> {
     Ok(json!(s.state.selected_layers.len()))
 }
 fn deselect_all(s: &mut Session, _: &Value) -> Result<Value> {
+    s.state.selected_rig2d = None;
     s.state.selected_layers.clear();
     s.state.selected_props.clear();
     s.state.selected_keys.clear();
@@ -205,7 +206,7 @@ fn delete(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!(ids.len()))
 }
 
-fn clear_clipboards(s: &mut Session) {
+pub(crate) fn clear_clipboards(s: &mut Session) {
     s.state.clipboard.clear();
     s.state.key_clipboard.clear();
     s.state.effect_clipboard.clear();

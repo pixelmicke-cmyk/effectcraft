@@ -254,6 +254,24 @@ fn duplicate(s: &mut Session, p: &Value) -> Result<Value> {
                         m.layer = map.get(&m.layer).copied().unwrap_or(m.layer);
                     }
                 }
+                for rig in &mut comp.rigs2d {
+                    // A composition copy owns fresh controls and references its own bones.
+                    let end = proj.next_id.checked_add(2).ok_or_else(|| bad(c, "no ids available for a 2D rig copy"))?;
+                    rig.id = effectcraft_project::rig2d::RigId(proj.next_id);
+                    rig.target.uid = end - 1;
+                    proj.next_id = end;
+                    for layer in &mut rig.layers {
+                        *layer = map.get(layer).copied().ok_or_else(|| bad(c, "2D rig refers to a missing layer"))?;
+                    }
+                }
+                for group in &mut comp.timeline_groups {
+                    let next = proj.next_id.checked_add(1).ok_or_else(|| bad(c, "no ids available for a timeline group copy"))?;
+                    group.id = effectcraft_project::timeline_groups::TimelineGroupId(proj.next_id);
+                    proj.next_id = next;
+                    for layer in &mut group.layers {
+                        *layer = map.get(layer).copied().ok_or_else(|| bad(c, "timeline group refers to a missing layer"))?;
+                    }
+                }
             }
             let nid = proj.add_item(&name, it.label, it.parent, kind);
             created.push(nid);

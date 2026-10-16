@@ -7,7 +7,7 @@
 use effectcraft_engine::commands::shape_tool::PaintKind;
 use effectcraft_engine::effects::puppet::PinKind;
 use effectcraft_engine::geom::{Mat3, vec2 as gv2};
-use effectcraft_engine::project::{Comp, Layer, LayerId, LayerSource};
+use effectcraft_engine::project::{Comp, ItemId, Layer, LayerId, LayerSource, rig2d::RigId};
 use effectcraft_engine::render::EvalCtx;
 use effectcraft_engine::render::three_d::{self, CameraState, View3D};
 use effectcraft_engine::time::Tick;
@@ -26,6 +26,16 @@ pub struct ViewerMap {
     pub zoom: f32,
     pub comp: [f32; 2],
     pub area: Rect,
+}
+
+/// A rejected target edit leaves the document valid; retain its error separately
+/// until a document/time change or a successful retry, so it remains visible.
+#[derive(Clone)]
+struct IkDragError {
+    rig: RigId,
+    revision: u64,
+    time: Tick,
+    message: String,
 }
 
 impl ViewerMap {
@@ -59,6 +69,14 @@ pub fn last_fit(ctx: &egui::Context) -> f32 {
 /// What a drag in the viewer is doing.
 #[derive(Clone, Debug)]
 enum Gesture {
+    /// An IK control moves in composition pixels, independently of layer selection.
+    IkHandle {
+        comp: ItemId,
+        rig: RigId,
+        start: [f64; 2],
+        target: [f64; 2],
+        time: Tick,
+    },
     /// Per layer: start position and the parent-space change per comp pixel of drag in x and y.
     Move {
         layers: Vec<(LayerId, [f64; 3], [f64; 3], [f64; 3])>,
@@ -820,7 +838,23 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // The expression error bar sits above the control bar while expressions fail.
     let err_h = super::expr_bar::height(app, &ctx, cid);
     let err_bar = Rect::from_min_max(pos2(rect.min.x, bar.min.y - err_h), pos2(rect.max.x, bar.min.y));
-    let full = Rect::from_min_max(pos2(rect.min.x, nav.max.y), pos2(rect.max.x, err_bar.min.y));
+    let mut rig_validator = effectcraft_engine::render::Renderer::new(&app.session.project, app.session.footage.as_ref(), Default::default());
+    rig_validator.expr = app.session.expr.as_deref();
+    let drag_error_id = egui::Id::new(("viewer-ik-drag-error", cid.0));
+    let drag_error = ctx.data_mut(|d| {
+        let error = d.get_temp::<IkDragError>(drag_error_id)?;
+        if error.revision != app.session.revision || error.time != app.session.time() || !comp.rigs2d.iter().any(|r| r.id == error.rig) {
+            d.remove::<IkDragError>(drag_error_id);
+            None
+        } else {
+            Some(error.message)
+        }
+    });
+    let rig_error = drag_error.or_else(|| rig_validator.validate_rigs(cid, app.session.time()).err());
+    let rig_error_text = rig_error.as_ref().map(|error| p.layout(error.clone(), Tokens::ui(11.5), t.warning, (rect.width() - 16.0).max(1.0)));
+    let rig_h = rig_error_text.as_ref().map_or(0.0, |text| text.size().y + 12.0);
+    let rig_bar = Rect::from_min_max(pos2(rect.min.x, err_bar.min.y - rig_h), pos2(rect.max.x, err_bar.min.y));
+    let full = Rect::from_min_max(pos2(rect.min.x, nav.max.y), pos2(rect.max.x, rig_bar.min.y));
     let pasteboard = app.ui.viewer.pasteboard.map(|[r, g, b]| Color32::from_rgb(r, g, b)).unwrap_or(t.pasteboard);
     // View ▸ Switch View Layout: extra views (Top / Front / Right) beside the main view, which
     // keeps the overlays and the interaction.
@@ -1086,6 +1120,40 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // Path points last, over the boxes' handles (#1042).
     ov::draw_vertex_marks(&painter, &vertex_marks, app.session.prefs.general.path_point_size as f32 + 1.0);
 
+    // UI-only controls: paint after layer/path handles, never into rendered pixels.
+    // Keep the hit radius in screen points so zoom changes neither usability nor priority.
+    let mut ik_hits = Vec::new();
+    if app.layer_controls_visible() {
+        for rig in &comp.rigs2d {
+            if !rig.layers.iter().all(|id| comp.layer(*id).is_some_and(|l| l.is_active_at(time))) {
+                continue;
+            }
+            let effectcraft_engine::project::Value::Vec2(target) = rig.target.value_at(time) else {
+                continue;
+            };
+            if !target.iter().all(|v| v.is_finite()) {
+                continue;
+            }
+            let center = map.to_screen(target);
+            if !center.x.is_finite() || !center.y.is_finite() || !area.expand(12.0).contains(center) {
+                continue;
+            }
+            let selected = app.session.state.selected_rig2d == Some(rig.id);
+            let color = t.label(rig.label);
+            painter.circle_filled(center, 8.0, Color32::from_black_alpha(210));
+            painter.circle_stroke(center, 8.0, Stroke::new(2.0, color));
+            painter.line_segment([center - vec2(4.0, 0.0), center + vec2(4.0, 0.0)], Stroke::new(1.0, color));
+            painter.line_segment([center - vec2(0.0, 4.0), center + vec2(0.0, 4.0)], Stroke::new(1.0, color));
+            if selected {
+                painter.circle_stroke(center, 11.0, Stroke::new(1.0, color));
+            }
+            painter.text(center + vec2(12.0, -12.0), Align2::LEFT_BOTTOM, "IK", Tokens::ui(10.0), color);
+            app.auto.add(&format!("viewer.ikHandle.{}", rig.id.0), Rect::from_center_size(center, vec2(24.0, 24.0)), "IK target: drag to move");
+            ik_hits.push((rig.id, target, center));
+        }
+    }
+    let ik_at = |pos: Pos2| ik_hits.iter().rev().find(|(_, _, center)| center.distance(pos) <= 12.0).copied();
+
     // Settings ▸ 3D: Extended Viewer (3D layers outlined beyond the comp frame) and Show 3D
     // Reference Axes (world X/Y/Z in the corner, turning with the view).
     let has_3d = comp.layers.iter().any(|l| l.is_3d() && l.is_active_at(time));
@@ -1287,6 +1355,36 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             app.ui.status = e;
         }
     }
+    super::ik_connect::sync(app);
+    if let (Some(endpoint), Some(tip)) = (app.ui.ik_connect.endpoint, super::ik_connect::tip(app))
+        && let Some(layer) = comp.layer(tip)
+    {
+        let point = ectx.world_matrix(layer).apply(effectcraft_engine::geom::vec3(endpoint[0], endpoint[1], 0.0));
+        let center = map.to_screen([point.x, point.y]);
+        if center.x.is_finite() && center.y.is_finite() {
+            painter.circle_stroke(center, 9.0, Stroke::new(2.0, app.tokens.accent));
+            painter.line_segment([center - vec2(13.0, 0.0), center + vec2(13.0, 0.0)], Stroke::new(1.0, app.tokens.accent));
+            painter.line_segment([center - vec2(0.0, 13.0), center + vec2(0.0, 13.0)], Stroke::new(1.0, app.tokens.accent));
+            app.auto.add("viewer.ikEndpoint", Rect::from_center_size(center, vec2(26.0, 26.0)), "Chosen IK endpoint");
+        }
+    }
+    if app.ui.ik_connect.picking {
+        if resp.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            app.ui.ik_connect.picking = false;
+        } else if resp.clicked()
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            if let Err(error) = super::ik_connect::choose_endpoint(app, map.to_comp(pos)) {
+                app.ui.ik_connect.error = error;
+            }
+        }
+        // This mode owns all presses, including drags and double clicks. No layer gestures.
+        ui.data_mut(|d| d.remove::<Gesture>(egui::Id::new("viewer-gesture")));
+        return;
+    }
     // Path vertices and tangent handles take the press before the bounding-box handles (#1042).
     let vertex_at = |pos: Pos2, tangents: bool| -> Option<VertexHit> {
         let reach = vertex_grab_radius(pos, handle_hits.iter().map(|(_, _, h, _)| *h));
@@ -1307,6 +1405,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             Tool::Orbit => egui::CursorIcon::Alias,
             Tool::PanCamera => egui::CursorIcon::Move,
             Tool::Dolly => egui::CursorIcon::ResizeVertical,
+            Tool::Selection if ik_at(hp).is_some() && !app.ui.viewer.roi_draw => egui::CursorIcon::Grab,
             t if t.is_pen() => {
                 pen_cursor(
                     &ctx,
@@ -1398,6 +1497,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             _ if app.ui.viewer.roi_draw => Some(Gesture::Overlay(ov::Drag::Roi { start: map.to_comp(press), keep: [None, None] })),
             // A region of interest handle: resize it from the opposite corner / edge.
             _ if roi_drag(app, &map, comp_rect, zoom, press).is_some() => roi_drag(app, &map, comp_rect, zoom, press).map(Gesture::Overlay),
+            Tool::Selection if ik_at(press).is_some() => ik_at(press).map(|(rig, target, _)| {
+                if let Err(error) = app.session.execute("rig.select2d", json!({"comp":cid.0,"rig":rig.0})) {
+                    app.ui.status = error.to_string();
+                }
+                Gesture::IkHandle { comp: cid, rig, start: map.to_comp(press), target, time }
+            }),
             Tool::Selection if ft.as_ref().and_then(|f| ov::begin_ft_drag(f, press, &map)).is_some() => {
                 ft.as_ref().and_then(|f| ov::begin_ft_drag(f, press, &map)).map(Gesture::Overlay)
             }
@@ -1598,6 +1703,25 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let cpt = map.to_comp(pos);
         let merge = format!("viewer-drag-{}", ui.data(|d| d.get_temp::<u64>(egui::Id::new("viewer-drag-n")).unwrap_or(0)));
         match g {
+            Gesture::IkHandle { comp, rig, start, target, time } => {
+                if app.session.active_comp_id() == Some(comp) && app.session.time_of(comp) == time {
+                    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                    let position = [target[0] + cpt[0] - start[0], target[1] + cpt[1] - start[1]];
+                    let merge = format!("{merge}-ik-{}-{}", comp.0, rig.0);
+                    if let Err(error) = app.session.execute("rig.setTarget2d", json!({"comp":comp.0,"rig":rig.0,"position":position,"merge":merge})) {
+                        app.ui.status = error.to_string();
+                        ctx.data_mut(|d| d.insert_temp(drag_error_id, IkDragError { rig, revision: app.session.revision, time, message: error.to_string() }));
+                        ctx.request_repaint();
+                        ui.data_mut(|d| d.remove::<Gesture>(gid));
+                        app.session.history.merge_key = None;
+                    } else {
+                        ctx.data_mut(|d| d.remove::<IkDragError>(drag_error_id));
+                    }
+                } else {
+                    ui.data_mut(|d| d.remove::<Gesture>(gid));
+                    app.session.history.merge_key = None;
+                }
+            }
             Gesture::Pan { start_pan } => {
                 // No total drag on the release frame: keep the pan reached so far (it used to
                 // snap back to where the drag began).
@@ -1790,6 +1914,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if resp.drag_stopped() {
         if let (Some(g), Some(pos)) = (gesture, resp.interact_pointer_pos()) {
             match g {
+                Gesture::IkHandle { .. } => {
+                    app.session.history.merge_key = None;
+                }
                 Gesture::PinMarquee { start } => {
                     // Pins inside the box, per layer; Shift adds to the selection.
                     let r = Rect::from_two_pos(start, pos);
@@ -1874,6 +2001,13 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     {
         let cpt = map.to_comp(pos);
         match app.ui.tool {
+            Tool::Selection if !space_pan && !app.ui.viewer.roi_draw && ik_at(pos).is_some() => {
+                if let Some((rig, _, _)) = ik_at(pos)
+                    && let Err(error) = app.session.execute("rig.select2d", json!({"comp":cid.0,"rig":rig.0}))
+                {
+                    app.ui.status = error.to_string();
+                }
+            }
             Tool::Zoom => {
                 let k = if mods.alt { 0.5 } else { 2.0 };
                 let nz = (zoom * k).clamp(0.01, 32.0);
@@ -1969,6 +2103,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
     if resp.double_clicked()
         && !text_owns
+        && resp.interact_pointer_pos().is_none_or(|pos| app.ui.tool != Tool::Selection || ik_at(pos).is_none())
         && app.ui.tool == Tool::Selection
         && let Some(pos) = resp.interact_pointer_pos()
         && let Some((l, m)) = vertex_at(pos, false).map(|h| (h.layer, h.mask)).or_else(|| ov::segment_at(&paths, &map, pos, 6.0).map(|s| (s.0, s.1)))
@@ -1983,6 +2118,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         ov::begin_free_transform(&ctx, l, m);
     } else if resp.double_clicked()
         && !text_owns
+        && resp.interact_pointer_pos().is_none_or(|pos| app.ui.tool != Tool::Selection || ik_at(pos).is_none())
         && !app.ui.tool.is_pen()
         && let Some(pos) = resp.interact_pointer_pos()
     {
@@ -2030,6 +2166,13 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     vt::bottom_bar(app, ui, bar, zoom, time, &comp);
     if err_h > 0.0 {
         super::expr_bar::draw(app, ui, err_bar, cid);
+    }
+    if let (Some(error), Some(text)) = (rig_error, rig_error_text) {
+        let p = ui.painter().with_clip_rect(rig_bar);
+        p.rect_filled(rig_bar, 0.0, Color32::from_rgb(0x4a, 0x3a, 0x12));
+        p.galley(rig_bar.min + vec2(8.0, 6.0), text, app.tokens.warning);
+        ui.interact(rig_bar, egui::Id::new("viewer-ik-error"), Sense::hover()).on_hover_text(&error);
+        app.auto.add("viewer.ikError", rig_bar, &error);
     }
 }
 

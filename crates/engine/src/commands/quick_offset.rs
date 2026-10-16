@@ -108,6 +108,7 @@ fn keys(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
         st.selected_keys = move_key_refs(comp, &from, |l, t| {
+            let Some(l)=l else { return Ok(t) };
             let Some(d) = by_layer.get(&l.id) else { return Ok(t) };
             let what = format!("a key of \"{}\"", l.name);
             shifted(l.start_time, *d, NAME, &what)?;

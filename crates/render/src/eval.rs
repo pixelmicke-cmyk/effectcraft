@@ -155,6 +155,15 @@ impl<'a> EvalCtx<'a> {
     /// [`Self::local_matrix`] with the source's pixel aspect folded into the scale (`par`; 1 for
     /// a parent's matrix, which children don't inherit).
     fn local_matrix_par(&self, layer: &Layer, par: f64) -> Mat4 {
+        match crate::rig2d::local_matrix(self, layer, par) {
+            Ok(Some(matrix)) => matrix,
+            // Legacy infallible readers retain the authored pose on an unsupported rig.
+            // validate_rigs/rig2d_pose expose the error to viewer and export callers.
+            Ok(None) | Err(_) => self.authored_local_matrix_par(layer, par),
+        }
+    }
+
+    pub(crate) fn authored_local_matrix_par(&self, layer: &Layer, par: f64) -> Mat4 {
         let Some(tr) = layer.transform() else { return Mat4::IDENTITY };
         let three = layer.is_3d();
         let pos = self.position(layer, tr);

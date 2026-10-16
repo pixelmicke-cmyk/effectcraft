@@ -105,7 +105,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
         y += 10.0;
     }
-
+    if selected == 2 {
+        section_header(app, ui, &p, x0, w, y, "2D IK Rig", "properties.ik2d");
+        y = super::ik_connect::show(app, ui, x0, y + ROW_H + 4.0, w);
+    }
     // ---------------------------------------------------------------- Text / Paragraph / Animation
     // While the layer's text is edited in the viewer, the text sections show and change the
     // selected characters.

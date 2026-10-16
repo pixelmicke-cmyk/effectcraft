@@ -22,6 +22,7 @@ pub mod gradient_handles;
 pub mod graph;
 pub mod graph_tools;
 pub mod home;
+pub mod ik_connect;
 pub mod info;
 pub mod key_dialogs;
 pub mod layer_panel;
